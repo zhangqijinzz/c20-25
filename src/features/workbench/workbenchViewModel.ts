@@ -10,8 +10,15 @@ import {
   type WorkspacePlan,
   type WorkspaceStatus,
 } from '../../shared/models'
-import { clampDeskSize, clampItemDimension } from '../../shared/layoutRules'
-import { moveCanvasItem, rotateCanvasItem } from '../canvas/canvasViewModel'
+import { clampDeskSize, clampItemDimension, clampRotation, diagnosePlacement } from '../../shared/layoutRules'
+import {
+  fitCanvasItem,
+  moveCanvasItem,
+  nudgeCanvasItem,
+  rotateCanvasItem,
+  setCanvasItemRotation,
+  snapCanvasItemRotation,
+} from '../canvas/canvasViewModel'
 import { createMaterialDraft } from '../materials/materialsViewModel'
 import { inspectPlan } from '../inspection/inspectionViewModel'
 import { LocalWorkspaceRepository, type WorkspaceRepository } from './workspaceRepository'
@@ -31,6 +38,10 @@ export interface WorkspaceViewModel {
   removeItem: (id: string) => void
   moveItem: (id: string, x: number, y: number) => void
   rotateItem: (id: string, delta: number) => void
+  setItemRotation: (id: string, rotation: number) => void
+  snapItemRotation: (id: string) => void
+  nudgeItem: (id: string, deltaX: number, deltaY: number) => void
+  fitItem: (id: string) => void
   updateItem: (id: string, patch: Partial<Pick<DeskItem, 'widthMm' | 'heightMm' | 'x' | 'y'>>) => void
   updateDesk: (field: 'deskWidthMm' | 'deskHeightMm', value: number) => void
   createNewPlan: () => void
@@ -114,9 +125,53 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
     updateActivePlan((plan) => ({ ...plan, items: moveCanvasItem(plan.items, id, x, y) }), '位置已更新')
   }, [updateActivePlan])
 
+  const describeRotationOutcome = useCallback((plan: WorkspacePlan, item: DeskItem): string => {
+    const diagnosis = diagnosePlacement(plan, item, { excludeId: item.id })
+    if (diagnosis.outOfBounds || diagnosis.overlapIds.length > 0) {
+      return `已转到 ${Math.round(item.rotation)}°，但当前角度下${diagnosis.overlapIds.length > 0 ? '压到其他设备' : ''}${diagnosis.outOfBounds && diagnosis.overlapIds.length > 0 ? '且' : ''}${diagnosis.outOfBounds ? '超出桌面' : ''}，请微调位置或就近挪位`
+    }
+    return `已转到 ${Math.round(item.rotation)}°，围绕设备中心旋转`
+  }, [])
+
+  const commitRotation = useCallback((items: DeskItem[]) => {
+    if (!activePlan) return
+    const rotated = items.find((item) => item.id === selectedItemId)
+    updateActivePlan(
+      () => ({ ...activePlan, items }),
+      rotated ? describeRotationOutcome({ ...activePlan, items }, rotated) : '角度已更新',
+    )
+  }, [activePlan, describeRotationOutcome, selectedItemId, updateActivePlan])
+
   const rotateItem = useCallback((id: string, delta: number) => {
-    updateActivePlan((plan) => ({ ...plan, items: rotateCanvasItem(plan.items, id, delta) }), '角度已更新')
+    if (!activePlan) return
+    commitRotation(rotateCanvasItem(activePlan.items, id, delta))
+  }, [activePlan, commitRotation])
+
+  const setItemRotation = useCallback((id: string, rotation: number) => {
+    if (!activePlan || !Number.isFinite(rotation)) return
+    commitRotation(setCanvasItemRotation(activePlan.items, id, clampRotation(rotation)))
+  }, [activePlan, commitRotation])
+
+  const snapItemRotation = useCallback((id: string) => {
+    if (!activePlan) return
+    const items = snapCanvasItemRotation(activePlan.items, id)
+    const rotated = items.find((item) => item.id === id)
+    updateActivePlan(() => ({ ...activePlan, items }), rotated ? `已取整到 ${Math.round(rotated.rotation)}°` : '角度已取整')
+  }, [activePlan, updateActivePlan])
+
+  const nudgeItem = useCallback((id: string, deltaX: number, deltaY: number) => {
+    updateActivePlan((plan) => ({ ...plan, items: nudgeCanvasItem(plan.items, id, deltaX, deltaY) }), '位置已微调')
   }, [updateActivePlan])
+
+  const fitItem = useCallback((id: string) => {
+    if (!activePlan) return
+    const result = fitCanvasItem(activePlan, id)
+    if (!result.position) {
+      setFeedback('当前角度附近 700 mm 内找不到放得下的位置，请先微调角度或桌面尺寸')
+      return
+    }
+    updateActivePlan(() => ({ ...activePlan, items: result.items }), '已保持角度并挪到最近的可放置位置')
+  }, [activePlan, updateActivePlan])
 
   const updateItem = useCallback((id: string, patch: Partial<Pick<DeskItem, 'widthMm' | 'heightMm' | 'x' | 'y'>>) => {
     updateActivePlan((plan) => ({
@@ -189,6 +244,10 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
     removeItem,
     moveItem,
     rotateItem,
+    setItemRotation,
+    snapItemRotation,
+    nudgeItem,
+    fitItem,
     updateItem,
     updateDesk,
     createNewPlan,
