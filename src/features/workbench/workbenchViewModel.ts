@@ -10,8 +10,15 @@ import {
   type WorkspacePlan,
   type WorkspaceStatus,
 } from '../../shared/models'
-import { clampDeskSize, clampItemDimension } from '../../shared/layoutRules'
-import { moveCanvasItem, rotateCanvasItem } from '../canvas/canvasViewModel'
+import { clampDeskSize, clampItemDimension, findFitOffset, isInsideDesk, orientedBoxesOverlap } from '../../shared/layoutRules'
+import {
+  moveCanvasItem,
+  nudgeCanvasItem,
+  resizeCanvasItemAroundCenter,
+  rotateCanvasItem,
+  setCanvasItemRotation,
+  snapCanvasItemRotation,
+} from '../canvas/canvasViewModel'
 import { createMaterialDraft } from '../materials/materialsViewModel'
 import { inspectPlan } from '../inspection/inspectionViewModel'
 import { LocalWorkspaceRepository, type WorkspaceRepository } from './workspaceRepository'
@@ -31,7 +38,12 @@ export interface WorkspaceViewModel {
   removeItem: (id: string) => void
   moveItem: (id: string, x: number, y: number) => void
   rotateItem: (id: string, delta: number) => void
-  updateItem: (id: string, patch: Partial<Pick<DeskItem, 'widthMm' | 'heightMm' | 'x' | 'y'>>) => void
+  setItemRotation: (id: string, angle: number) => void
+  snapItemRotation: (id: string) => void
+  nudgeItem: (id: string, dx: number, dy: number) => void
+  fitItemInPlace: (id: string) => void
+  updateItemCenter: (id: string, center: Partial<Pick<DeskItem, 'x' | 'y'>>) => void
+  updateItemSize: (id: string, size: Partial<Pick<DeskItem, 'widthMm' | 'heightMm'>>) => void
   updateDesk: (field: 'deskWidthMm' | 'deskHeightMm', value: number) => void
   createNewPlan: () => void
   duplicatePlan: () => void
@@ -110,24 +122,84 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
     setSelectedItemId((current) => current === id ? null : current)
   }, [updateActivePlan])
 
+  const placementFeedback = useCallback((candidatePlan: WorkspacePlan, id: string, base: string): string => {
+    const item = candidatePlan.items.find((entry) => entry.id === id)
+    if (!item) return base
+    const inside = isInsideDesk(item, candidatePlan.deskWidthMm, candidatePlan.deskHeightMm)
+    const overlaps = candidatePlan.items.some((other) => other.id !== id && orientedBoxesOverlap(other, item))
+    if (!inside && overlaps) return `${base}，但当前角度超出桌面且压住其他设备，可微调或自动归位`
+    if (!inside) return `${base}，但当前角度超出桌面边界，可微调或自动归位`
+    if (overlaps) return `${base}，但当前角度压住其他设备，可微调或自动归位`
+    return base
+  }, [])
+
   const moveItem = useCallback((id: string, x: number, y: number) => {
     updateActivePlan((plan) => ({ ...plan, items: moveCanvasItem(plan.items, id, x, y) }), '位置已更新')
   }, [updateActivePlan])
 
   const rotateItem = useCallback((id: string, delta: number) => {
-    updateActivePlan((plan) => ({ ...plan, items: rotateCanvasItem(plan.items, id, delta) }), '角度已更新')
-  }, [updateActivePlan])
+    if (!activePlan) return
+    const items = rotateCanvasItem(activePlan.items, id, delta)
+    updateActivePlan((plan) => ({ ...plan, items }), placementFeedback({ ...activePlan, items }, id, '角度已更新'))
+  }, [activePlan, placementFeedback, updateActivePlan])
 
-  const updateItem = useCallback((id: string, patch: Partial<Pick<DeskItem, 'widthMm' | 'heightMm' | 'x' | 'y'>>) => {
+  const setItemRotation = useCallback((id: string, angle: number) => {
+    if (!activePlan) return
+    const items = setCanvasItemRotation(activePlan.items, id, angle)
+    updateActivePlan((plan) => ({ ...plan, items }), placementFeedback({ ...activePlan, items }, id, '角度已设定'))
+  }, [activePlan, placementFeedback, updateActivePlan])
+
+  const snapItemRotation = useCallback((id: string) => {
+    if (!activePlan) return
+    const items = snapCanvasItemRotation(activePlan.items, id)
+    updateActivePlan((plan) => ({ ...plan, items }), placementFeedback({ ...activePlan, items }, id, '已取整到最近档位'))
+  }, [activePlan, placementFeedback, updateActivePlan])
+
+  const nudgeItem = useCallback((id: string, dx: number, dy: number) => {
+    if (!activePlan) return
+    const items = nudgeCanvasItem(activePlan.items, id, dx, dy)
+    updateActivePlan((plan) => ({ ...plan, items }), placementFeedback({ ...activePlan, items }, id, '位置已微调'))
+  }, [activePlan, placementFeedback, updateActivePlan])
+
+  const fitItemInPlace = useCallback((id: string) => {
+    if (!activePlan) return
+    const item = activePlan.items.find((entry) => entry.id === id)
+    if (!item) return
+    const offset = findFitOffset(activePlan, item)
+    if (!offset) {
+      setFeedback('当前角度下桌面放不下这个设备，请换个角度或改小尺寸')
+      return
+    }
+    if (offset.dx === 0 && offset.dy === 0) {
+      setFeedback('当前角度已经可以放下，无需移动')
+      return
+    }
+    const items = nudgeCanvasItem(activePlan.items, id, offset.dx, offset.dy)
+    const distance = Math.round(Math.hypot(offset.dx, offset.dy))
+    updateActivePlan((plan) => ({ ...plan, items }), `已保持角度平移 ${distance} mm，自动放到可容纳的位置`)
+  }, [activePlan, updateActivePlan])
+
+  const updateItemCenter = useCallback((id: string, center: Partial<Pick<DeskItem, 'x' | 'y'>>) => {
     updateActivePlan((plan) => ({
       ...plan,
-      items: plan.items.map((item) => item.id === id ? {
-        ...item,
-        ...patch,
-        widthMm: patch.widthMm === undefined ? item.widthMm : clampItemDimension(patch.widthMm, item.widthMm),
-        heightMm: patch.heightMm === undefined ? item.heightMm : clampItemDimension(patch.heightMm, item.heightMm),
-      } : item),
-    }), '尺寸参数已更新')
+      items: plan.items.map((item) => {
+        if (item.id !== id) return item
+        const next = { ...item }
+        if (center.x !== undefined && Number.isFinite(center.x)) next.x = center.x - item.widthMm / 2
+        if (center.y !== undefined && Number.isFinite(center.y)) next.y = center.y - item.heightMm / 2
+        return next
+      }),
+    }), '中心位置已更新')
+  }, [updateActivePlan])
+
+  const updateItemSize = useCallback((id: string, size: Partial<Pick<DeskItem, 'widthMm' | 'heightMm'>>) => {
+    updateActivePlan((plan) => {
+      const current = plan.items.find((item) => item.id === id)
+      if (!current) return plan
+      const widthMm = size.widthMm === undefined ? current.widthMm : clampItemDimension(size.widthMm, current.widthMm)
+      const heightMm = size.heightMm === undefined ? current.heightMm : clampItemDimension(size.heightMm, current.heightMm)
+      return { ...plan, items: resizeCanvasItemAroundCenter(plan.items, id, widthMm, heightMm) }
+    }, '本体尺寸已更新，旋转中心保持不变')
   }, [updateActivePlan])
 
   const updateDesk = useCallback((field: 'deskWidthMm' | 'deskHeightMm', value: number) => {
@@ -189,7 +261,12 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
     removeItem,
     moveItem,
     rotateItem,
-    updateItem,
+    setItemRotation,
+    snapItemRotation,
+    nudgeItem,
+    fitItemInPlace,
+    updateItemCenter,
+    updateItemSize,
     updateDesk,
     createNewPlan,
     duplicatePlan,
